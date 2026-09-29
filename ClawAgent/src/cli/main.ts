@@ -1,9 +1,13 @@
 // `clawagent` entry point.
 //
-// M0 ships three commands: `doctor`, `version`, and `help`. The shape is built
-// for the milestones after it — `agent` (M1), `gateway` (M4), `daemon` (M5) —
+// M0 shipped `doctor`, `version`, and `help`; M1 adds `chat`. The shape is built
+// for the milestones after it — `agent` (M2), `gateway` (M4), `daemon` (M5) —
 // which is why command handling is a table and every command receives the same
 // resolved context instead of reaching for `process` itself.
+//
+// `runCli` is async from M1 onward. Streaming a model reply cannot be
+// synchronous, and every later command (agent loop, gateway, daemon) is async
+// too, so making the dispatcher async now avoids a second breaking change.
 //
 // Nothing here calls `process.exit`. `runCli` returns an exit code and the thin
 // wrapper in `bin/clawagent.mjs` applies it, so the whole CLI is testable
@@ -16,15 +20,34 @@ import {
   type ParseResult,
 } from "./argv.ts";
 import { formatDoctorJson, runDoctor } from "./doctor.ts";
+import {
+  AGENT_COMMAND,
+  runAgent,
+} from "./agent.ts";
+import {
+  CHAT_COMMAND,
+  createReadlinePrompter,
+  mergeModelFlagOverrides,
+  runChat,
+  type ChatPrompter,
+} from "./chat.ts";
+import { resolveConfig } from "../config/config.ts";
+import type { ChatRuntime } from "../provider/runtime.ts";
 import { resolveDefaultClawAgentPaths, logFilePath, type ClawAgentPaths } from "../config/paths.ts";
 import { createLogger, parseLogLevel, type Logger } from "../logging/logger.ts";
 import { resolvePackageVersion } from "../version.ts";
 
-/** Usage errors: bad flags, unknown commands. */
-export const EXIT_USAGE = 2;
-/** The host cannot run on this device. */
-export const EXIT_UNHEALTHY = 1;
-export const EXIT_OK = 0;
+// Exit codes live in their own module so command modules can use them without
+// importing this file, which would be a cycle. Re-exported for callers that
+// already reach for them here.
+export {
+  EXIT_CONFIG,
+  EXIT_OK,
+  EXIT_PROVIDER,
+  EXIT_UNHEALTHY,
+  EXIT_USAGE,
+} from "./exit-codes.ts";
+import { EXIT_CONFIG, EXIT_OK, EXIT_PROVIDER, EXIT_UNHEALTHY, EXIT_USAGE } from "./exit-codes.ts";
 
 export const DOCTOR_COMMAND: CommandSpec = {
   name: "doctor",
@@ -56,10 +79,18 @@ export const HELP_COMMAND: CommandSpec = {
 };
 
 /** Every command this build knows about. */
-export const COMMANDS: readonly CommandSpec[] = [DOCTOR_COMMAND, VERSION_COMMAND, HELP_COMMAND];
+export const COMMANDS: readonly CommandSpec[] = [
+  AGENT_COMMAND,
+  CHAT_COMMAND,
+  DOCTOR_COMMAND,
+  VERSION_COMMAND,
+  HELP_COMMAND,
+];
 
-/** Minimal stream shape, so tests can capture output without a TTY. */
-export type OutputStream = { write(chunk: string): unknown };
+// Re-exported so existing imports keep working; the definition lives in
+// `streams.ts` to keep command modules from depending on the dispatcher.
+export type { OutputStream } from "./streams.ts";
+import { writeLines as writeLinesTo, type OutputStream } from "./streams.ts";
 
 export type CliContext = {
   /** Arguments after the program name. Defaults to none, for embedding. */
@@ -69,6 +100,17 @@ export type CliContext = {
   env?: NodeJS.ProcessEnv;
   /** Injectable version, for tests. */
   version?: string;
+  /** Injectable chat prompter; without it `chat` requires `--message`. */
+  prompter?: ChatPrompter;
+  /** Injectable model runtime factory, so tests never reach the network. */
+  chatRuntimeFactory?: () => Promise<ChatRuntime>;
+  /**
+   * Same injection for `agent`. One option per command rather than a shared one,
+   * because a test that swaps the runtime for `chat` and then exercises `agent`
+   * would otherwise silently run the fake against a command it was never written
+   * for.
+   */
+  agentRuntimeFactory?: () => Promise<ChatRuntime>;
 };
 
 export type CliResult = {
@@ -110,6 +152,10 @@ function emitVersion(
     node: process.versions.node,
     platform: process.platform,
     arch: process.arch,
+    // Which flags this process actually started with. On a phone this is the
+    // difference between "the transform flag is missing" and an hour of guessing
+    // why a reused core file failed to load.
+    execArgv: process.execArgv,
   };
   if (flagBoolean(parsed.flags, "json")) {
     stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
@@ -122,7 +168,7 @@ function emitVersion(
 }
 
 /** Runs the CLI and returns everything it produced. */
-export function runCli(options: CliContext = {}): CliResult {
+export async function runCli(options: CliContext = {}): Promise<CliResult> {
   const env = options.env ?? process.env;
   const out: string[] = [];
   const err: string[] = [];
@@ -131,11 +177,7 @@ export function runCli(options: CliContext = {}): CliResult {
   const version = options.version ?? resolvePackageVersion();
 
   const parsed = parseArgv(options.argv ?? [], COMMANDS);
-  const write = (stream: OutputStream, lines: readonly string[]): void => {
-    for (const line of lines) {
-      stream.write(`${line}\n`);
-    }
-  };
+  const write = writeLinesTo;
 
   // Usage errors win over everything else: reporting a healthy device after a
   // mistyped command would hide the real problem.
@@ -196,6 +238,77 @@ export function runCli(options: CliContext = {}): CliResult {
       stdout: out.join(""),
       stderr: err.join(""),
     };
+  }
+
+  if (parsed.command === "chat") {
+    logger.debug("chat starting");
+    const message = flagString(parsed.flags, "message");
+    // A prompter is only built when stdin will actually be read: creating a
+    // readline interface over a pipe that is never consumed would leave the
+    // process waiting on input it never asked for.
+    const prompter =
+      options.prompter ??
+      (message === undefined
+        ? createReadlinePrompter({ input: process.stdin, output: stdout, prompt: "> " })
+        : undefined);
+    const config = mergeModelFlagOverrides(resolveConfig(paths, env), parsed.flags);
+    const systemPrompt = flagString(parsed.flags, "system");
+    const chat = await runChat({
+      env,
+      stdout,
+      stderr,
+      config,
+      ...(paths ? { paths } : {}),
+      ...(message === undefined ? {} : { message }),
+      ...(prompter ? { prompter } : {}),
+      ...(systemPrompt ? { systemPrompt } : {}),
+      ...(flagBoolean(parsed.flags, "show-thinking") ? { showThinking: true } : {}),
+      ...(options.chatRuntimeFactory ? { runtimeFactory: options.chatRuntimeFactory } : {}),
+    });
+    logger.info("chat finished", { turns: chat.replies.length, exitCode: chat.exitCode });
+    logger.close();
+    return { exitCode: chat.exitCode, stdout: out.join(""), stderr: err.join("") };
+  }
+
+  if (parsed.command === "agent") {
+    logger.debug("agent starting");
+    const message = flagString(parsed.flags, "message");
+    const config = mergeModelFlagOverrides(resolveConfig(paths, env), parsed.flags);
+    // A prompter is built for both modes here, unlike `chat`: the approval gate
+    // reads from the same input, so even `agent -m "..."` may have to ask. When
+    // nothing asks, the run still has to close it, or the process waits on a
+    // stream nobody will write to again.
+    const prompter =
+      options.prompter ??
+      createReadlinePrompter({ input: process.stdin, output: stdout, prompt: "> " });
+    const systemPrompt = flagString(parsed.flags, "system");
+    const approve = flagString(parsed.flags, "approve");
+    const workspace = flagString(parsed.flags, "workspace");
+    const maxTurns = flagString(parsed.flags, "max-turns");
+    let agent: Awaited<ReturnType<typeof runAgent>>;
+    try {
+      agent = await runAgent({
+        env,
+        stdout,
+        stderr,
+        config,
+        prompter,
+        ...(message === undefined ? {} : { message }),
+        ...(systemPrompt ? { systemPrompt } : {}),
+        ...(approve ? { approve } : {}),
+        ...(workspace ? { workspace } : {}),
+        ...(maxTurns ? { maxTurns } : {}),
+        ...(flagBoolean(parsed.flags, "yes") ? { yes: true } : {}),
+        ...(flagBoolean(parsed.flags, "show-thinking") ? { showThinking: true } : {}),
+        ...(flagBoolean(parsed.flags, "dry-run") ? { dryRun: true } : {}),
+        ...(options.agentRuntimeFactory ? { runtimeFactory: options.agentRuntimeFactory } : {}),
+      });
+    } finally {
+      prompter.close();
+    }
+    logger.info("agent finished", { runs: agent.replies.length, toolCalls: agent.toolCalls, exitCode: agent.exitCode });
+    logger.close();
+    return { exitCode: agent.exitCode, stdout: out.join(""), stderr: err.join("") };
   }
 
   // Unreachable while parseArgv rejects unknown commands, but a command added to

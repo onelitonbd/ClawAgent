@@ -1,177 +1,105 @@
-// Anti-drift contract tests for the path rules ClawAgent reimplements locally.
+// Delegation contract for the rules ClawAgent used to duplicate.
 //
-// ClawAgent cannot import `@openclaw/normalization-core` at runtime (workspace
-// packages use `.js` specifiers, which Node's type-stripping loader cannot
-// resolve against `.ts` sources), so `src/config/paths.ts` duplicates the
-// home-dir and agent-id rules. These tests are what make that duplication safe:
-// they compare ClawAgent's implementation against the real package across every
-// environment the mobile host has to survive, and fail the moment the two
-// disagree.
+// HISTORY, because the shape of this file only makes sense with it: at M0,
+// ClawAgent could not import `@openclaw/normalization-core` at runtime, since
+// workspace packages resolve their imports with `.js` specifiers that Node's
+// type-stripping loader cannot match against `.ts` sources. So `src/config/paths.ts`
+// reimplemented the home-dir and agent-id rules, and this file compared the two
+// implementations case by case to keep the copy honest.
 //
-// If normalization-core changes, this file fails and ClawAgent must follow.
-// That is the point.
+// M1 removed the reason for the copy: `src/runtime/source-resolution.ts` maps
+// `@openclaw/*` onto package sources, so `paths.ts` now imports these functions
+// outright. The comparison tests became tautologies — a function compared with
+// itself always agrees — which is worse than no test, because it looks like
+// coverage.
+//
+// What is worth enforcing now is the opposite direction: that the delegation is
+// real and nobody reintroduces a local copy. Reference equality proves it, and it
+// fails the moment someone writes a lookalike implementation with the same name.
 
-import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
-  normalizeAgentId as normalizeAgentIdUpstream,
   isValidAgentId as isValidAgentIdUpstream,
+  normalizeAgentId as normalizeAgentIdUpstream,
+  normalizeAgentIdStrict as normalizeAgentIdStrictUpstream,
 } from "@openclaw/normalization-core/agent-id";
 import {
   normalizeHomeDirValue as normalizeHomeDirValueUpstream,
   resolveOsHomeDir as resolveOsHomeDirUpstream,
 } from "@openclaw/normalization-core/home-dir";
 import {
-  normalizeAgentId,
   isValidAgentId,
+  normalizeAgentId,
   normalizeHomeDirValue,
   resolveOsHomeDir,
 } from "./paths.ts";
 
-// A homedir stub that mimics Node on Termux: `os.homedir()` reads `$HOME` and
-// falls back to a platform-specific guess that is wrong on Android.
-function stubHomedir(value: string | undefined) {
-  return () => {
-    if (value === undefined) {
-      // Mirrors the real failure mode: Node returns `$PREFIX/home`, a path that
-      // does not exist when `HOME` is unset.
-      return "/data/data/com.termux/files/usr/home";
-    }
-    return value;
-  };
-}
-
-const HOME_CASES: ReadonlyArray<{
-  name: string;
-  env: NodeJS.ProcessEnv;
-  homedir: string | undefined;
-}> = [
-  { name: "plain HOME", env: { HOME: "/home/user" }, homedir: "/home/user" },
-  { name: "HOME with whitespace", env: { HOME: "  /home/user  " }, homedir: "/home/user" },
-  { name: "USERPROFILE fallback", env: { USERPROFILE: "C:\\Users\\dev" }, homedir: undefined },
-  { name: "HOME wins over USERPROFILE", env: { HOME: "/home/user", USERPROFILE: "C:\\Users\\dev" }, homedir: "/home/user" },
-  { name: "empty HOME", env: { HOME: "" }, homedir: "/fallback" },
-  { name: "whitespace-only HOME", env: { HOME: "   " }, homedir: "/fallback" },
-  { name: 'literal "undefined" HOME', env: { HOME: "undefined" }, homedir: "/fallback" },
-  { name: 'literal "null" HOME', env: { HOME: "null" }, homedir: "/fallback" },
-  { name: "no env at all", env: {}, homedir: undefined },
-  {
-    name: "Termux: PREFIX only (desktop shell, must not relocate)",
-    env: { PREFIX: "/data/data/com.termux/files/usr" },
-    homedir: "/fallback",
-  },
-  {
-    name: "Termux: PREFIX + ANDROID_DATA, no HOME",
-    env: {
-      PREFIX: "/data/data/com.termux/files/usr",
-      ANDROID_DATA: "/data",
-    },
-    homedir: undefined,
-  },
-  {
-    name: "Termux: PREFIX with trailing slash",
-    env: {
-      PREFIX: "/data/data/com.termux/files/usr/",
-      ANDROID_DATA: "/data",
-    },
-    homedir: undefined,
-  },
-  {
-    name: "Termux: HOME set wins over PREFIX derivation",
-    env: {
-      HOME: "/data/data/com.termux/files/home",
-      PREFIX: "/data/data/com.termux/files/usr",
-      ANDROID_DATA: "/data",
-    },
-    homedir: undefined,
-  },
-  {
-    name: "Termux-like PREFIX under a different package name",
-    env: { PREFIX: "/data/data/com.other/files/usr", ANDROID_DATA: "/data" },
-    homedir: "/fallback",
-  },
-];
-
-describe("home directory rules match @openclaw/normalization-core", () => {
-  it.each(HOME_CASES)("$name", ({ env, homedir }) => {
-    const stub = stubHomedir(homedir);
-    expect(resolveOsHomeDir(env, stub)).toBe(resolveOsHomeDirUpstream(env, stub));
-  });
-});
-
-describe("normalizeHomeDirValue matches @openclaw/normalization-core", () => {
-  it.each([
-    undefined,
-    "",
-    "   ",
-    "undefined",
-    "null",
-    "/data/data/com.termux/files/home",
-    "  /home/user  ",
-    "~",
-  ])("agrees for %j", (value) => {
-    expect(normalizeHomeDirValue(value)).toBe(normalizeHomeDirValueUpstream(value));
-  });
-});
-
-const AGENT_ID_CASES = [
+/** Inputs that must never become a directory name. */
+const AGENT_ID_CASES: ReadonlyArray<string | undefined | null> = [
   "main",
   "Main",
-  "MAIN",
   "agent-1",
   "agent_1",
-  "a",
-  "0",
+  "a".repeat(80),
+  "../../etc/passwd",
+  "..",
+  ".",
   "",
   "   ",
-  "-leading",
-  "trailing-",
-  "..",
-  "../etc",
-  "../../etc/passwd",
-  "has space",
-  "has/slash",
-  "has.dot",
-  "has\\backslash",
-  "héllo",
-  "a".repeat(64),
-  "a".repeat(65),
-  "a".repeat(200),
-  "---",
-  "!!!",
+  "a.b",
+  "a/b",
+  "a\\b",
+  undefined,
+  null,
 ];
 
-describe("agent id rules match @openclaw/normalization-core", () => {
-  it.each(AGENT_ID_CASES)("isValidAgentId agrees for %j", (value) => {
-    expect(isValidAgentId(value)).toBe(isValidAgentIdUpstream(value));
+describe("paths.ts delegates to @openclaw/normalization-core", () => {
+  it.each([
+    ["normalizeHomeDirValue", normalizeHomeDirValue, normalizeHomeDirValueUpstream],
+    ["resolveOsHomeDir", resolveOsHomeDir, resolveOsHomeDirUpstream],
+    ["isValidAgentId", isValidAgentId, isValidAgentIdUpstream],
+  ] as const)("%s is the upstream function, not a copy", (_name, local, upstream) => {
+    // Identity, not equivalence: a re-implementation could agree on every case
+    // tried here and still diverge on the next one upstream adds.
+    expect(local).toBe(upstream);
   });
 
-  it.each(AGENT_ID_CASES)("normalizeAgentId agrees for %j", (value) => {
-    const upstream = normalizeAgentIdUpstream(value);
-    const local = normalizeAgentId(value);
-    // ClawAgent intentionally does not fall back to "main": an unrepresentable
-    // id returns undefined here and `err("unrepresentable")` upstream. Both
-    // mean "no usable id", so the contract is: local is undefined exactly when
-    // upstream signals failure, and identical otherwise.
-    if (local === undefined) {
-      expect(upstream).toBe("main");
-      expect(isValidAgentIdUpstream(value)).toBe(false);
-    } else {
-      expect(local).toBe(upstream);
+  it.each(AGENT_ID_CASES)(
+    "normalizeAgentId(%j) is the strict upstream result, minus its fallback",
+    (value) => {
+      // This one cannot be a re-export, and must not be: upstream's
+      // `normalizeAgentId` returns "main" for unusable input, while ClawAgent
+      // returns undefined so a caller has to choose the fallback deliberately.
+      // The contract is therefore "derived from `normalizeAgentIdStrict`".
+      const strict = normalizeAgentIdStrictUpstream(value);
+      expect(normalizeAgentId(value)).toBe(strict.ok ? strict.value : undefined);
+    },
+  );
+
+  it("never silently defaults an unusable agent id to main", () => {
+    // The whole reason the adapter exists: upstream's loose helper answers "main"
+    // for input it cannot use, which would route a misaddressed message into the
+    // main agent's session history.
+    for (const value of ["..", "", "   ", undefined, null]) {
+      expect(normalizeAgentId(value)).toBeUndefined();
+      expect(isValidAgentId(value)).toBe(false);
+      expect(normalizeAgentIdUpstream(value)).toBe("main");
     }
   });
 
-  it("never produces a path-escaping agent directory name", () => {
-    for (const value of AGENT_ID_CASES) {
-      const normalized = normalizeAgentId(value);
-      if (!normalized) {
-        continue;
-      }
-      expect(path.resolve("/state/agents", normalized)).toBe(
-        path.join("/state/agents", normalized),
-      );
-      expect(normalized).not.toContain(".");
-      expect(normalized).not.toContain(path.sep);
-    }
+  it("sanitizes a traversal attempt rather than accepting or defaulting it", () => {
+    // Path characters are stripped, so the result is a safe directory name; it is
+    // not rejected outright, and it is certainly not "main".
+    const normalized = normalizeAgentId("../../etc/passwd");
+    expect(normalized).toBe("etc-passwd");
+    expect(normalized).not.toContain(".");
+    expect(normalized).not.toContain("/");
+  });
+
+  it("re-exports the agent-id pair together", () => {
+    // `isValidAgentId` and `normalizeAgentId` must come from the same source, or
+    // a value one accepts the other can reject.
+    expect(isValidAgentId("main")).toBe(normalizeAgentId("main") !== undefined);
+    expect(isValidAgentId("..")).toBe(normalizeAgentId("..") !== undefined);
   });
 });

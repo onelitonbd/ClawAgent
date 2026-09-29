@@ -1,93 +1,61 @@
 // Home and state path resolution for ClawAgent.
 //
-// This module deliberately reimplements the OS home-dir rules that
-// `@openclaw/normalization-core/home-dir` implements, rather than importing it.
-// The reason is on-device execution: every workspace package resolves its
-// imports with `.js` specifiers (normalization-core alone has 48), which Node's
-// type-stripping loader cannot resolve against `.ts` sources. ClawAgent runs
-// from source on the phone, so a runtime dependency on any workspace package
-// would make it unstartable. M0 therefore depends on nothing.
+// The OS home-dir rules and the agent-id rules are owned by
+// `@openclaw/normalization-core` and imported from it, not reimplemented here.
+// What this module owns is the part that is genuinely ClawAgent's: the
+// `CLAWAGENT_HOME` override, the on-disk layout, and the filesystem-safety
+// checks around turning an agent id into a directory name.
 //
-// That is a real cost: home-dir rules can drift between the two. The drift is
-// closed by `src/config/paths-contract.test.ts`, which asserts byte-for-byte
-// agreement between `resolveOsHomeDir` here and
-// `resolveOsHomeDir` in normalization-core across desktop, Termux, Windows, and
-// broken-env cases. Change one and the contract test fails until the other
-// matches. This is the same anti-drift pattern used for `src/platform/termux.ts`.
-//
-// Once a build/bundle step exists (M1+), ClawAgent switches to the real package
-// and this duplication is deleted.
+// Importing a workspace package from source works because of the resolve hook in
+// `src/runtime/source-resolution.ts`. See `AGENTS.md` for why that hook exists,
+// what it replaced, and what it costs.
 
 import os from "node:os";
 import path from "node:path";
+import {
+  isValidAgentId,
+  normalizeAgentIdStrict,
+} from "@openclaw/normalization-core/agent-id";
+import {
+  normalizeHomeDirValue,
+  resolveOsHomeDir,
+} from "@openclaw/normalization-core/home-dir";
 
+// Imported under their public names and re-exported as the same bindings. A
+// re-export rather than a wrapper function is what makes drift structurally
+// impossible: `paths-contract.test.ts` asserts the exported value IS the upstream
+// function, so a local lookalike with matching behaviour still fails the suite.
 /**
- * Drops values that are not usable as a home directory.
+ * Rules owned by normalization-core, re-exported unchanged.
  *
- * `HOME` arrives unset, empty, whitespace-only, or as the literal strings
- * `"undefined"` / `"null"` on Windows and from misconfigured launchers. On
- * Termux, Node's `os.homedir()` reads `HOME` and returns `$PREFIX/home` — which
- * does not exist — when `HOME` is missing, so this guard is the difference
- * between a working state directory and one written to a path that cannot be
- * created.
- */
-export function normalizeHomeDirValue(value: string | undefined): string | undefined {
-  const trimmed = value?.trim();
-  return trimmed && trimmed !== "undefined" && trimmed !== "null" ? trimmed : undefined;
-}
-
-function normalizeSafe(homedir: () => string): string | undefined {
-  try {
-    return normalizeHomeDirValue(homedir());
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * Recovers the Termux home from `$PREFIX`.
+ * ClawAgent callers get one place to import path rules from, while the shared
+ * package stays the single owner of the behaviour:
  *
- * Termux's real home is `/data/data/com.termux/files/home`, a sibling of
- * `$PREFIX`. This only fires when both `$PREFIX` and `$ANDROID_DATA` are set, so
- * a stray `PREFIX` on a desktop shell cannot relocate the home directory.
+ *   - `normalizeHomeDirValue` drops a `HOME` that arrives unset, blank, or as the
+ *     literal strings `"undefined"`/`"null"`.
+ *   - `resolveOsHomeDir` handles the Termux case where `HOME` is unset and Node's
+ *     `os.homedir()` would return `$PREFIX/home` — a path that does not exist.
+ *     `$PREFIX/..` is authoritative there.
+ *   - `isValidAgentId` reports whether a value is already canonical.
+ *
+ * None of that is duplicated here, and it cannot be: these are the upstream
+ * bindings themselves, which `paths-contract.test.ts` verifies by identity.
  */
-function resolveTermuxHome(env: NodeJS.ProcessEnv): string | undefined {
-  const prefix = normalizeHomeDirValue(env.PREFIX);
-  if (!prefix || !normalizeHomeDirValue(env.ANDROID_DATA)) {
-    return undefined;
-  }
-  if (!/(?:^|\/)com\.termux\/files\/usr\/?$/u.test(prefix.replace(/\\/gu, "/"))) {
-    return undefined;
-  }
-  return path.resolve(prefix, "..", "home");
-}
+export { isValidAgentId, normalizeHomeDirValue, resolveOsHomeDir };
 
-function resolveRawOsHomeDir(env: NodeJS.ProcessEnv, homedir: () => string): string | undefined {
-  return (
-    normalizeHomeDirValue(env.HOME) ??
-    normalizeHomeDirValue(env.USERPROFILE) ??
-    resolveTermuxHome(env) ??
-    normalizeSafe(homedir)
-  );
-}
+/** Directory name under the OS home that holds all ClawAgent state. */
+export const DEFAULT_STATE_DIR_NAME = ".clawagent";
 
-/** Absolute OS home directory, or `undefined` when it cannot be determined. */
-export function resolveOsHomeDir(
-  env: NodeJS.ProcessEnv = process.env,
-  homedir: () => string = os.homedir,
-): string | undefined {
-  const raw = resolveRawOsHomeDir(env, homedir);
-  return raw ? path.resolve(raw) : undefined;
-}
+/** Config file name inside the ClawAgent home. */
+export const CONFIG_FILE_NAME = "clawagent.json";
 
 /**
  * Home directory ClawAgent should use, honouring `CLAWAGENT_HOME`.
  *
- * `CLAWAGENT_HOME` overrides the OS home — the mobile equivalent of
- * `OPENCLAW_HOME`, kept under ClawAgent's own name so a device can run both
- * hosts without their state colliding. A leading `~` is expanded against the OS
- * home and dropped when that cannot be resolved; an unresolved tilde must never
- * become a literal `~` directory.
+ * The mobile equivalent of `OPENCLAW_HOME`, kept under ClawAgent's own name so a
+ * device can run both hosts without their state colliding. A leading `~` is
+ * expanded against the OS home and dropped when that cannot be resolved; an
+ * unresolved tilde must never become a literal `~` directory.
  */
 export function resolveClawAgentHome(
   env: NodeJS.ProcessEnv = process.env,
@@ -99,7 +67,7 @@ export function resolveClawAgentHome(
     return osHome ? path.resolve(osHome, DEFAULT_STATE_DIR_NAME) : undefined;
   }
   if (explicit === "~" || explicit.startsWith("~/") || explicit.startsWith("~\\")) {
-    const osHome = resolveRawOsHomeDir(env, homedir);
+    const osHome = resolveOsHomeDir(env, homedir);
     if (!osHome) {
       return undefined;
     }
@@ -107,12 +75,6 @@ export function resolveClawAgentHome(
   }
   return path.resolve(explicit);
 }
-
-/** Directory name under the OS home that holds all ClawAgent state. */
-export const DEFAULT_STATE_DIR_NAME = ".clawagent";
-
-/** Config file name inside the ClawAgent home. */
-export const CONFIG_FILE_NAME = "clawagent.json";
 
 /** The full on-disk layout, resolved once at startup. */
 export type ClawAgentPaths = {
@@ -139,14 +101,13 @@ export type ClawAgentPaths = {
 
 /** Resolves the full layout from a ClawAgent home directory. */
 export function resolveClawAgentPaths(home: string): ClawAgentPaths {
-  const agentsDir = path.join(home, "agents");
   const mediaDir = path.join(home, "media");
   return {
     home,
     configFile: path.join(home, CONFIG_FILE_NAME),
     stateDir: path.join(home, "state"),
     sessionDatabase: path.join(home, "state", "clawagent.sqlite"),
-    agentsDir,
+    agentsDir: path.join(home, "agents"),
     logsDir: path.join(home, "logs"),
     credentialsDir: path.join(home, "credentials"),
     mediaDir,
@@ -170,46 +131,25 @@ export function resolveDefaultClawAgentPaths(
 }
 
 /**
- * Characters permitted in an agent id.
- *
- * This mirrors `@openclaw/normalization-core/agent-id` exactly — same character
- * class, same length bound, same lowercase canonical form — because agent ids
- * are directory names under `agents/` and the desktop host writes the same
- * layout. Two hosts that disagree about an id would produce two directories for
- * one agent. `paths-contract.test.ts` pins the agreement.
- *
- * Dots are deliberately excluded (the desktop rule excludes them too), which is
- * also what makes `..` and hidden directories unreachable from an id.
- */
-const AGENT_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/iu;
-const INVALID_AGENT_ID_CHARS_RE = /[^a-z0-9_-]+/giu;
-
-/** True when a value is already a canonical agent-id input. */
-export function isValidAgentId(value: string | undefined | null): boolean {
-  const trimmed = (value ?? "").trim();
-  return Boolean(trimmed) && AGENT_ID_PATTERN.test(trimmed);
-}
-
-/**
  * Canonicalizes an agent id for filesystem use, or returns `undefined`.
  *
- * Unlike the desktop helper this does not fall back to `"main"`: a silent
+ * The character class, length bound, repair rules, and lowercase canonical form
+ * all come from `@openclaw/normalization-core/agent-id`, so an agent id means
+ * the same thing here as it does to the desktop host that writes the same
+ * `agents/<id>/` layout. Dots are excluded there, which is also what makes `..`
+ * and hidden directories unreachable from an id.
+ *
+ * Unlike the shared loose helper this does not fall back to `"main"`: a silent
  * default would let a misrouted message land in the main agent's session
  * history, and on a phone the state directory is small enough that such a
- * mistake is invisible until it is expensive. Callers decide the fallback.
+ * mistake stays invisible until it is expensive. Callers decide the fallback.
  */
 export function normalizeAgentId(value: string | undefined | null): string | undefined {
-  const trimmed = (value ?? "").trim().toLowerCase();
-  if (AGENT_ID_PATTERN.test(trimmed)) {
-    return trimmed;
-  }
-  const repaired = trimmed
-    .replace(INVALID_AGENT_ID_CHARS_RE, "-")
-    .replace(/^-+/u, "")
-    .replace(/-+$/u, "")
-    .slice(0, 64);
-  return repaired ? repaired : undefined;
+  const result = normalizeAgentIdStrict(value);
+  return result.ok ? result.value : undefined;
 }
+
+
 
 /** Directory holding one agent's sessions. Returns `undefined` for a bad id. */
 export function agentDir(paths: ClawAgentPaths, agentId: string): string | undefined {
@@ -223,7 +163,12 @@ export function agentSessionsDir(paths: ClawAgentPaths, agentId: string): string
   return dir ? path.join(dir, "sessions") : undefined;
 }
 
-/** Absolute path to a log file under `logs/`. */
+/**
+ * Absolute path to a log file under `logs/`.
+ *
+ * Separators are what enable traversal, so they are replaced. A literal `..`
+ * inside a filename is inert.
+ */
 export function logFilePath(paths: ClawAgentPaths, name: string): string {
   const safe = name.replace(/[^A-Za-z0-9._-]/gu, "_");
   return path.join(paths.logsDir, `${safe}.log`);

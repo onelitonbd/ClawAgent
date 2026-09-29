@@ -13,15 +13,52 @@
     "clawagent": "./bin/clawagent.mjs"
   },
   "scripts": {
+    "chat": "node ./bin/clawagent.mjs chat",
+    "agent": "node ./bin/clawagent.mjs agent",
     "doctor": "node ./bin/clawagent.mjs doctor",
     "smoke": "bash ./scripts/smoke-termux.sh",
-    "test": "cd .. && node scripts/run-vitest.mjs run --config test/vitest/vitest.unit.config.ts ClawAgent"
+    "test": "cd .. && node scripts/run-vitest.mjs run --config test/vitest/vitest.unit.config.ts ClawAgent",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
   },
-  "dependencies": {},
-  "devDependencies": {
-    "@openclaw/normalization-core": "workspace:*"
+  "dependencies": {
+    "@anthropic-ai/sdk": "0.127.0",
+    "@google/genai": "2.23.0",
+    "@mistralai/mistralai": "2.7.0",
+    "libphonenumber-js": "1.13.13",
+    "mdast-util-from-markdown": "2.0.3",
+    "mdast-util-gfm-table": "2.0.0",
+    "micromark-extension-gfm-table": "2.1.2",
+    "openai": "7.20.0",
+    "partial-json": "0.1.7",
+    "typebox": "1.3.34",
+    "zod": "4.6.5"
   },
   "engines": {
     "node": ">=24.16.0 <25 || >=26.1.0"
+  },
+  "clawagent": {
+    "comment": "Two records, neither of which npm reads. `reusedPackages` names the @openclaw/* cores this host composes; they are deliberately absent from `dependencies` because the entry point resolves them from the checkout's packages/ directory, and because the only protocol that could express that link (`workspace:*`) is pnpm-only — declaring it there makes `npm install`, the install path the README gives a phone user, fail outright with EUNSUPPORTEDPROTOCOL. `externalDependenciesOfReusedCores` lists the npm packages those cores import; they are absent from the cores' own installs when the roots here do not reach them, so they are declared directly. src/runtime/reused-packages.ts recomputes both sets and test/boundary.test.ts fails on any drift, including a non-registry protocol in `dependencies`.",
+    "reusedPackages": [
+      "agent-core",
+      "ai",
+      "llm-core",
+      "model-catalog-core",
+      "normalization-core",
+      "retry",
+      "tool-call-repair"
+    ],
+    "externalDependenciesOfReusedCores": [
+      "@anthropic-ai/sdk",
+      "@google/genai",
+      "@mistralai/mistralai",
+      "libphonenumber-js",
+      "mdast-util-from-markdown",
+      "mdast-util-gfm-table",
+      "micromark-extension-gfm-table",
+      "openai",
+      "partial-json",
+      "typebox",
+      "zod"
+    ]
   }
 }

@@ -12,19 +12,41 @@
 // `src/test-utils/repo-files.js`, because importing from `src/` is exactly what
 // it forbids — a boundary test that violates the boundary proves nothing.
 //
-// Runtime dependencies are zero on purpose: every workspace package resolves its
-// imports with `.js` specifiers, which Node's type-stripping loader cannot
-// resolve against `.ts` sources. ClawAgent runs from source on the device, so a
-// runtime workspace dependency would make it unstartable until a build step
-// exists. See `src/config/paths.ts` for the duplication this costs and the
-// contract tests that pay it back.
+// DEPENDENCIES (changed at M1)
+//
+// M0 had none, because every workspace package resolves its imports with `.js`
+// specifiers that Node's type-stripping loader cannot match against `.ts`
+// sources. M1 fixes that with a resolve hook (`src/runtime/source-resolution.ts`)
+// and then composes the shared cores from source, which is what makes provider
+// chat a reuse rather than a reimplementation.
+//
+// That inversion has a consequence the rules below enforce: because the cores are
+// read from the checkout instead of installed, *their* npm dependencies never
+// reach an install rooted here. ClawAgent must declare them itself, and the list
+// has to match what the cores actually need — recomputed from their manifests on
+// every run, never pasted. A missing entry is a confusing ERR_MODULE_NOT_FOUND
+// deep inside a provider transport; a stale extra is dead weight on a phone.
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+// ClawAgent's own modules, not the repository's `src/`: the reuse list and the
+// resolver are the things these rules are about, and testing them against a
+// second hand-written copy would prove nothing.
+import {
+  describeLoadClosureDependencies,
+  staleLoadPathRecords,
+  UNDECLARED_DEPENDENCIES,
+  REUSED_PACKAGES,
+  SOURCE_LOAD_CLOSURE,
+  collectRequiredExternalDependencies,
+} from "../src/runtime/reused-packages.ts";
+import { resolveOpenClawSource } from "../src/runtime/source-resolution.ts";
 
 const PACKAGE_ROOT = path.resolve(fileURLToPath(import.meta.url), "..", "..");
+const REPO_ROOT = path.resolve(PACKAGE_ROOT, "..");
+const PACKAGES_DIR = path.join(REPO_ROOT, "packages");
 
 /** Source files are the ones whose imports must stay clean. */
 const SOURCE_EXTENSIONS = new Set([".ts", ".mts", ".mjs", ".js"]);
@@ -342,12 +364,108 @@ describe("ClawAgent dependency boundary", () => {
     dependencies?: Record<string, string>;
     optionalDependencies?: Record<string, string>;
     devDependencies?: Record<string, string>;
+    clawagent?: {
+      reusedPackages?: string[];
+      externalDependenciesOfReusedCores?: string[];
+    };
   };
+  const dependencies = manifest.dependencies ?? {};
+  const workspaceDeps = Object.keys(dependencies).filter((name) =>
+    name.startsWith("@openclaw/"),
+  );
+  const externalDeps = Object.keys(dependencies).filter(
+    (name) => !name.startsWith("@openclaw/"),
+  );
 
-  it("has zero runtime dependencies", () => {
-    // A runtime dependency cannot be type-stripped from node_modules, so any
-    // entry here breaks the device install, not just the bundle size.
-    expect(Object.keys(manifest.dependencies ?? {})).toEqual([]);
+  it("declares every reused core outside the npm dependency graph", () => {
+    // The relationship has to be written down somewhere, or a standalone install
+    // of this package silently loses it — but `dependencies` is the wrong place.
+    // The only range that could express "use this checkout" is `workspace:*`,
+    // which is a pnpm protocol: naming it in `dependencies` makes the plain
+    // `npm install --omit=dev` the README gives a phone user fail before it
+    // installs anything.
+    const declared = [...(manifest.clawagent?.reusedPackages ?? [])].sort();
+    expect(declared).toEqual([...REUSED_PACKAGES].sort());
+    expect(workspaceDeps).toEqual([]);
+  });
+
+  it("installs with a plain npm install on a device", () => {
+    // Every range must be something npm can fetch from the registry. This is the
+    // guard for the class of bug above: any package-manager-specific protocol,
+    // a git or file reference, or an alias makes the install line in the README
+    // unusable, and on a phone that is the whole product.
+    const registryRange = /^(?:\d+\.\d+\.\d+(?:[-+][\w.-]+)?|[\x7f<>=[\]().,*| 0-9ux^~.-]+)$/u;
+    const offenders: string[] = [];
+    for (const field of ["dependencies", "devDependencies", "optionalDependencies"] as const) {
+      for (const [name, range] of Object.entries(manifest[field] ?? {})) {
+        if (range.includes(":") || !registryRange.test(range)) {
+          offenders.push(`${field}.${name}: "${range}" is not a registry range`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it("declares exactly the external packages the reused cores need", () => {
+    // Recomputed from the cores' own manifests on every run. This is the drift
+    // guard: adding a core, or a core gaining a dependency, fails here until the
+    // install list is updated deliberately rather than by accident.
+    const { required, conflicts, unpinned } = collectRequiredExternalDependencies(PACKAGES_DIR);
+    expect(conflicts).toEqual([]);
+    // A load-path entry with no package to take a version from would otherwise
+    // land in package.json as a bare name with whatever npm feels like serving.
+    expect(unpinned).toEqual([]);
+    expect(externalDeps.sort()).toEqual(Object.keys(required).sort());
+  });
+
+  it("records a decision for every dependency of loaded code", () => {
+    // The failure this prevents is the interesting one: a reused core gains a
+    // transitive package, that package's npm dependencies are absent on a phone,
+    // and nothing in this repository says so. `@openclaw/ai` reaching
+    // markdown-core for a reasoning-tag parser is exactly that case, discovered
+    // by loading the graph rather than reading a manifest.
+    const undecided = describeLoadClosureDependencies(PACKAGES_DIR).filter(
+      (entry) => entry.decision === "undecided",
+    );
+    expect(
+      undecided.map((entry) => `${entry.package} -> ${entry.name} (${entry.range})`),
+    ).toEqual([]);
+  });
+
+  it("justifies every excluded dependency", () => {
+    // An exclusion without a reason is indistinguishable from an oversight, and
+    // the next person re-adds the package.
+    const unexplained = Object.entries(UNDECLARED_DEPENDENCIES)
+      .filter(([, reason]) => reason.trim().length < 20)
+      .map(([name]) => name);
+    expect(unexplained).toEqual([]);
+  });
+
+  it("keeps the dependency records about things that still exist", () => {
+    // Both maps name files in packages/*. When a core refactors, the entry has
+    // to go rather than quietly describe nothing.
+    const stale = staleLoadPathRecords(PACKAGES_DIR);
+    expect(stale.loadPath).toEqual([]);
+    expect(stale.excluded).toEqual([]);
+  });
+
+  it("keeps the manifest's own dependency record true", () => {
+    // `clawagent.externalDependenciesOfReusedCores` is the human-facing
+    // explanation of why those packages are in `dependencies` at all — a reader
+    // cannot recompute it, so the claim is either checked or it lies.
+    const recorded = [...(manifest.clawagent?.externalDependenciesOfReusedCores ?? [])].sort();
+    const { required } = collectRequiredExternalDependencies(PACKAGES_DIR);
+    expect(recorded).toEqual(Object.keys(required).sort());
+  });
+
+  it("pins external dependencies to the versions the cores declare", () => {
+    // Two versions of one SDK in a single process is how a provider starts
+    // failing in ways that look like a network problem.
+    const { required } = collectRequiredExternalDependencies(PACKAGES_DIR);
+    const mismatched = externalDeps
+      .filter((name) => dependencies[name] !== required[name])
+      .map((name) => `${name}: declared ${dependencies[name]}, cores want ${required[name]}`);
+    expect(mismatched).toEqual([]);
   });
 
   it("has no optional dependencies", () => {
@@ -356,8 +474,28 @@ describe("ClawAgent dependency boundary", () => {
     expect(Object.keys(manifest.optionalDependencies ?? {})).toEqual([]);
   });
 
+  it("keeps no native addon anywhere in the dependency set", () => {
+    // Termux cannot load glibc-linked prebuilds. The deny list names the packages
+    // that would be tempting to reach for and cannot be used here.
+    const native = [
+      /^node-pty$/u,
+      /^sharp$/u,
+      /^canvas$/u,
+      /^better-sqlite3$/u,
+      /^sqlite3$/u,
+      /^@lydell\//u,
+      /^@rolldown\//u,
+      /^esbuild$/u,
+      /^lightningcss$/u,
+    ];
+    const offenders = [...workspaceDeps, ...externalDeps].filter((name) =>
+      native.some((pattern) => pattern.test(name)),
+    );
+    expect(offenders).toEqual([]);
+  });
+
   it("keeps devDependencies inside the pure-TypeScript allowlist", () => {
-    const allowed = new Set(["@openclaw/normalization-core", "vitest", "typescript"]);
+    const allowed = new Set(["vitest", "typescript", "@types/node"]);
     const unexpected = Object.keys(manifest.devDependencies ?? {}).filter(
       (name) => !allowed.has(name),
     );
@@ -367,6 +505,95 @@ describe("ClawAgent dependency boundary", () => {
   it("ships no compiled artifacts in the tree", () => {
     const binaries = allFiles().filter((file) => /\.(?:node|o|a|so|dylib|dll)$/u.test(file));
     expect(binaries.map(relative)).toEqual([]);
+  });
+});
+
+describe("ClawAgent reuse boundary", () => {
+  /** Every `@openclaw/*` specifier ClawAgent source actually imports. */
+  function openclawSpecifiers(): Array<{ file: string; specifier: string }> {
+    const found: Array<{ file: string; specifier: string }> = [];
+    for (const file of sourceFiles()) {
+      for (const specifier of importSpecifiers(file)) {
+        if (specifier.startsWith("@openclaw/")) {
+          found.push({ file, specifier });
+        }
+      }
+    }
+    return found;
+  }
+
+  /** Reads the public entry points a package declares. */
+  function declaredExports(packageName: string): Set<string> {
+    const manifestPath = path.join(PACKAGES_DIR, packageName, "package.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+      exports?: Record<string, unknown>;
+    };
+    return new Set(Object.keys(manifest.exports ?? {}));
+  }
+
+  it("imports shared cores, proving the rule below is not vacuous", () => {
+    expect(openclawSpecifiers().length).toBeGreaterThan(0);
+  });
+
+  it("only imports cores on the declared reuse list", () => {
+    // The reuse list is a decision, not an accident of what happened to resolve.
+    const offenders = openclawSpecifiers()
+      .map(({ specifier }) => specifier.slice("@openclaw/".length).split("/")[0] ?? "")
+      .filter((packageName) => !SOURCE_LOAD_CLOSURE.includes(packageName));
+    expect([...new Set(offenders)].sort()).toEqual([]);
+  });
+
+  it("only imports declared public entry points", () => {
+    // Deep imports into another package's internals (`@openclaw/ai/src/...`)
+    // would resolve through the fallback rule and then break the moment that
+    // package moves a file. Only what `exports` declares is a contract.
+    const offenders: string[] = [];
+    for (const { file, specifier } of openclawSpecifiers()) {
+      const [packageName, ...subpath] = specifier.slice("@openclaw/".length).split("/");
+      if (!packageName) {
+        continue;
+      }
+      const key = subpath.length === 0 ? "." : `./${subpath.join("/")}`;
+      if (!declaredExports(packageName).has(key)) {
+        offenders.push(`${relative(file)} -> ${specifier}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it("resolves every imported specifier to real TypeScript source", () => {
+    // Regression guard for a bug that made `@openclaw/ai/providers` unloadable:
+    // `@openclaw/llm-core/event-stream` declares `./dist/utils/event-stream.mjs`,
+    // so its source is nested at `src/utils/event-stream.ts`. A resolver that
+    // assumed `src/<subpath>.ts` mapped it to nothing. Any subpath that stops
+    // resolving fails here rather than on a device.
+    const offenders: string[] = [];
+    for (const { file, specifier } of openclawSpecifiers()) {
+      const resolved = resolveOpenClawSource(specifier, PACKAGES_DIR);
+      if (!resolved || !statSync(resolved.file).isFile()) {
+        offenders.push(`${relative(file)} -> ${specifier}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it("resolves the subpaths that once broke, by name", () => {
+    // Named separately so a failure points at the exact contract that regressed
+    // instead of at whichever file happened to import it first.
+    for (const specifier of [
+      "@openclaw/ai",
+      "@openclaw/ai/providers",
+      "@openclaw/llm-core",
+      "@openclaw/llm-core/event-stream",
+      "@openclaw/llm-core/diagnostics",
+      "@openclaw/media-core/base64",
+      "@openclaw/normalization-core/agent-id",
+      "@openclaw/normalization-core/home-dir",
+    ]) {
+      const resolved = resolveOpenClawSource(specifier, PACKAGES_DIR);
+      expect(resolved, `${specifier} did not resolve`).toBeTruthy();
+      expect(resolved?.via, `${specifier} fell back to the layout heuristic`).toBe("exports");
+    }
   });
 });
 
@@ -382,5 +609,105 @@ describe("ClawAgent package shape", () => {
     expect(bin).toBeTruthy();
     expect(path.extname(bin ?? "")).toBe(".mjs");
     expect(statSync(path.join(PACKAGE_ROOT, bin ?? "")).isFile()).toBe(true);
+  });
+});
+
+describe("ClawAgent CLI startup closure", () => {
+  /**
+   * The modules `node bin/clawagent.mjs --help` loads before it prints anything.
+   *
+   * Kept as an explicit list of entries plus a walk, rather than as a list of
+   * files, so that adding an import to a CLI module puts that module under the
+   * rule automatically. Following only *relative* specifiers is what stops the
+   * walk at the shared cores: they are allowed to import npm packages, and the
+   * entry point loads them lazily, so they are not part of the startup cost.
+   */
+  const STARTUP_ENTRIES = ["src/cli/main.ts", "bin/clawagent.mjs"];
+
+  function stripComments(source: string): string {
+    return source
+      .replace(/\/\*[\s\S]*?\*\//gu, "")
+      .split("\n")
+      .filter((line) => !line.trim().startsWith("*") && !line.trim().startsWith("//"))
+      .join("\n");
+  }
+
+  /** Specifiers a file loads *statically*, i.e. before any of its code runs. */
+  function staticSpecifiers(file: string): string[] {
+    const source = stripComments(readFileSync(file, "utf8"));
+    const found: string[] = [];
+    for (const match of source.matchAll(/(?:^|\n)[ \t]*(import|export)([^;]*?)from[ \t]*["']([^"']+)["']/g)) {
+      const clause = (match[2] ?? "").trim();
+      // `import type` and `export type` vanish under Node's type stripping, so
+      // they cost nothing at startup. `import { type A, B }` does not: B is real.
+      if (/^type(\s|$)/u.test(clause)) {
+        continue;
+      }
+      found.push(match[3] as string);
+    }
+    return found;
+  }
+
+  function isBare(specifier: string): boolean {
+    return (
+      !specifier.startsWith(".") &&
+      !specifier.startsWith("/") &&
+      !specifier.startsWith("#") &&
+      !/^[a-z+.-]+:/iu.test(specifier)
+    );
+  }
+
+  function startupClosure(): string[] {
+    const seen = new Set<string>();
+    const queue = STARTUP_ENTRIES.map((entry) => path.join(PACKAGE_ROOT, entry));
+    while (queue.length > 0) {
+      const file = queue.shift() as string;
+      if (seen.has(file) || !statSync(file, { throwIfNoEntry: false })?.isFile()) {
+        continue;
+      }
+      seen.add(file);
+      for (const specifier of staticSpecifiers(file)) {
+        if (specifier.startsWith(".")) {
+          queue.push(path.resolve(path.dirname(file), specifier));
+        }
+      }
+    }
+    return [...seen].sort();
+  }
+
+  it("reaches every module in the package's own CLI tree", () => {
+    // A guard that quietly walks nothing is worse than no guard: it reads as
+    // coverage. `chat` and `agent` are both reachable from `main.ts`, so if the
+    // walk ever stops at a barrel file or a changed path, this fails first.
+    const closure = startupClosure();
+    expect(closure).toContain(path.join(PACKAGE_ROOT, "src/cli/chat.ts"));
+    expect(closure).toContain(path.join(PACKAGE_ROOT, "src/cli/agent.ts"));
+    expect(closure.length).toBeGreaterThan(10);
+  });
+
+  it("statically imports nothing that only an npm install can provide", () => {
+    // The failure this prevents is total: one static `import { Type } from
+    // "typebox"` anywhere in this closure means `clawagent doctor`, `version`, and
+    // `help` all die with ERR_MODULE_NOT_FOUND on a checkout that has not run
+    // `npm install` yet. That is the opposite of what doctor is for - it is the
+    // command the README tells you to run to find out whether the install worked -
+    // and on a phone it is also the only command that can explain the failure.
+    // The fix is to import the heavy thing where it is used, inside the async
+    // function that needs it, which is what `runAgent` and `createAgentSession`
+    // do for the tool layer.
+    // `@openclaw/*` is excluded because it is not an install requirement: the
+    // entry point maps those specifiers onto `packages/*/src` in this very
+    // checkout, and `src/config/paths.ts` relies on that for the home-directory
+    // rules it refuses to reimplement. Everything else bare can only come from
+    // `node_modules`.
+    const offenders: string[] = [];
+    for (const file of startupClosure()) {
+      for (const specifier of staticSpecifiers(file)) {
+        if (isBare(specifier) && !specifier.startsWith("@openclaw/")) {
+          offenders.push(`${path.relative(PACKAGE_ROOT, file)} -> "${specifier}"`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
   });
 });

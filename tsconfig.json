@@ -50,6 +50,18 @@
       "@openclaw/ai/internal/tool-schema": ["./packages/ai/src/internal/tool-schema.ts"],
       "@openclaw/agent-core": ["./packages/agent-core/src/index.ts"],
       "@openclaw/agent-core/*": ["./packages/agent-core/src/*"],
+      // Why an explicit entry and not the wildcard above: this config typechecks
+      // NodeNext with `allowImportingTsExtensions`, where a `paths` candidate is
+      // matched as written and no extension is ever guessed. So
+      // `"@openclaw/<pkg>/*": ["./packages/<pkg>/src/*"]"`, which the runtime
+      // resolver's own rules satisfy, matches nothing here, and every subpath that
+      // is actually imported needs its own `.ts` entry. Keep these in sync with
+      // `resolveOpenClawSource` in ClawAgent/src/runtime/source-resolution.ts,
+      // which is what makes the same names resolve at runtime.
+      "@openclaw/agent-core/harness/env/kill-tree": [
+        "./packages/agent-core/src/harness/env/kill-tree.ts"
+      ],
+      "@openclaw/tool-call-repair": ["./packages/tool-call-repair/src/index.ts"],
       "@openclaw/llm-core": ["./packages/llm-core/src/index.ts"],
       "@openclaw/llm-core/diagnostics": ["./packages/llm-core/src/utils/diagnostics.ts"],
       "@openclaw/llm-core/event-stream": ["./packages/llm-core/src/utils/event-stream.ts"],

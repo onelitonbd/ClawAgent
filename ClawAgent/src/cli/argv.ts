@@ -7,7 +7,11 @@
 //
 // Errors are returned, not thrown. A CLI that throws on a typo prints a stack
 // trace to a phone user who typed `clawagent doctr`; it should print the nearest
-// valid command instead.
+// valid command instead. Suggestion and edit-distance helpers live in
+// `../util/text-suggest.ts` so `provider/` can reuse them without depending on
+// the CLI.
+
+import { suggestName } from "../util/text-suggest.ts";
 
 export type FlagType = "boolean" | "string";
 
@@ -70,65 +74,9 @@ function applyDefault(flags: Record<string, string | boolean>, specs: readonly F
   }
 }
 
-/**
- * Suggests the closest known command for a typo.
- *
- * Prefix matching first (covers `doctr` -> nothing, `doc` -> `doctor`), then a
- * bounded edit distance. Deliberately conservative: a wrong suggestion is worse
- * than none.
- */
+/** Suggests the closest known command for a typo. */
 export function suggestCommand(input: string, commands: readonly CommandSpec[]): string | undefined {
-  const lower = input.toLowerCase();
-  const names = commands.map((command) => command.name);
-  const exact = names.find((name) => name === lower);
-  if (exact) {
-    return exact;
-  }
-  const prefix = names.find((name) => name.startsWith(lower) && lower.length >= 2);
-  if (prefix) {
-    return prefix;
-  }
-  let best: string | undefined;
-  let bestDistance = Number.POSITIVE_INFINITY;
-  for (const name of names) {
-    const distance = editDistance(lower, name);
-    if (distance < bestDistance) {
-      bestDistance = distance;
-      best = name;
-    }
-  }
-  // Only suggest when the typo is genuinely close.
-  return bestDistance <= 2 ? best : undefined;
-}
-
-/** Levenshtein distance, bounded by an early exit at `limit`. */
-export function editDistance(a: string, b: string, limit = 8): number {
-  if (a === b) {
-    return 0;
-  }
-  if (Math.abs(a.length - b.length) > limit) {
-    return limit + 1;
-  }
-  let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
-  for (let i = 1; i <= a.length; i += 1) {
-    const current = [i];
-    for (let j = 1; j <= b.length; j += 1) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      // `noUncheckedIndexedAccess` cannot see that i-1, j-1 and j are in range
-      // by construction here. Falling back to +Infinity rather than 0 keeps a
-      // genuine bounds mistake visible as an obviously wrong distance instead of
-      // silently producing a plausible one.
-      const deletion = (current[j - 1] ?? Number.POSITIVE_INFINITY) + 1;
-      const insertion = (previous[j] ?? Number.POSITIVE_INFINITY) + 1;
-      const substitution = (previous[j - 1] ?? Number.POSITIVE_INFINITY) + cost;
-      current[j] = Math.min(deletion, insertion, substitution);
-    }
-    if (Math.min(...current) > limit) {
-      return limit + 1;
-    }
-    previous = current;
-  }
-  return previous[b.length] ?? limit + 1;
+  return suggestName(input, commands.map((command) => command.name));
 }
 
 /** Parses `argv` (already stripped of node and the script path). */

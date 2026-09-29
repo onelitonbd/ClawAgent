@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { GLOBAL_FLAGS, editDistance, parseArgv, renderUsage, suggestCommand } from "./argv.ts";
+import { GLOBAL_FLAGS, parseArgv, renderUsage, suggestCommand } from "./argv.ts";
 // The command table lives with the entry point; the parser is generic.
 import { COMMANDS, DOCTOR_COMMAND } from "./main.ts";
 
@@ -141,24 +141,6 @@ describe("suggestCommand", () => {
 
   it("does not suggest from a single character prefix", () => {
     expect(suggestCommand("d", COMMANDS)).toBeUndefined();
-  });
-});
-
-describe("editDistance", () => {
-  it.each([
-    ["", "", 0],
-    ["abc", "abc", 0],
-    ["abc", "abd", 1],
-    ["abc", "ab", 1],
-    ["abc", "abcd", 1],
-    ["doctor", "doctr", 1],
-    ["kitten", "sitting", 3],
-  ])("distance(%j, %j) === %d", (a, b, expected) => {
-    expect(editDistance(a, b)).toBe(expected);
-  });
-
-  it("gives up past the limit", () => {
-    expect(editDistance("a".repeat(50), "b".repeat(50), 3)).toBe(4);
   });
 });
 

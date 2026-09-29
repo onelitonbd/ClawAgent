@@ -3,7 +3,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import acpCorePackageJson from "../../packages/acp-core/package.json" with { type: "json" };
+import agentCorePackageJson from "../../packages/agent-core/package.json" with { type: "json" };
 import normalizationCorePackageJson from "../../packages/normalization-core/package.json" with { type: "json" };
+import terminalCorePackageJson from "../../packages/terminal-core/package.json" with { type: "json" };
+import toolCallRepairPackageJson from "../../packages/tool-call-repair/package.json" with { type: "json" };
 import { pluginSdkSubpaths } from "../../scripts/lib/plugin-sdk-entries.mts";
 import privateLocalOnlyPluginSdkSubpaths from "../../scripts/lib/plugin-sdk-private-local-only-subpaths.json" with { type: "json" };
 import { createStateSchemaInlinePlugin } from "../../scripts/lib/state-schema-inline-plugin.mts";
@@ -499,6 +502,40 @@ export const sharedVitestConfig = {
       sourcePackageAlias("session-url-contract"),
       sourcePackageAlias("workboard-contract"),
       ...sourcePackageAliasesFromExports("acp-core", acpCorePackageJson.exports),
+      // ClawAgent (the Termux-native host) runs its tests from package sources,
+      // so the cores it composes need source aliases too. These two entries come
+      // before the generated ones on purpose: alias matching is first-match-wins,
+      // and `agent-core` flattens two source *directories* into single dist files,
+      // which the `src/<subpath>.ts` rule cannot express. `./harness/compaction`
+      // is the directory's own-basename module, and `./harness/branch-summarization`
+      // is its sibling — there is no `src/harness/branch-summarization.ts` at all.
+      {
+        find: "@openclaw/agent-core/harness/compaction",
+        replacement: path.join(
+          repoRoot,
+          "packages",
+          "agent-core",
+          "src",
+          "harness",
+          "compaction",
+          "compaction.ts",
+        ),
+      },
+      {
+        find: "@openclaw/agent-core/harness/branch-summarization",
+        replacement: path.join(
+          repoRoot,
+          "packages",
+          "agent-core",
+          "src",
+          "harness",
+          "compaction",
+          "branch-summarization.ts",
+        ),
+      },
+      ...sourcePackageAliasesFromExports("agent-core", agentCorePackageJson.exports),
+      ...sourcePackageAliasesFromExports("tool-call-repair", toolCallRepairPackageJson.exports),
+      ...sourcePackageAliasesFromExports("terminal-core", terminalCorePackageJson.exports),
       ...sourcePluginSdkSubpaths.map((subpath) => ({
         find: `openclaw/plugin-sdk/${subpath}`,
         replacement: path.join(repoRoot, "src", "plugin-sdk", `${subpath}.ts`),

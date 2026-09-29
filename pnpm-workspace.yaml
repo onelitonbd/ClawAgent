@@ -4,8 +4,11 @@ packages:
   - packages/*
   - extensions/*
   - examples/*
-  # Termux-native mobile host. Zero runtime dependencies by design: it runs from
-  # source on Android, where Node cannot strip types inside node_modules.
+  # Termux-native mobile host. Runs from source on Android, where Node cannot
+  # strip types inside node_modules. Its only npm dependencies are the vendor SDKs
+  # the reused @openclaw/* cores call; the cores themselves come from this
+  # checkout, so a plain `npm install --omit=dev` inside ClawAgent/ is enough and
+  # no workspace:* range is declared for them there.
   - ClawAgent
 
 minimumReleaseAge: 10080

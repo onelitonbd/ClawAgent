@@ -209,12 +209,166 @@ provable on a device. "Adopts" = reuse an existing package; "Builds" = new code.
 - **Deliverable:** `<bin> ask "…"` streams a rendered answer.
 - **Proof:** one live call each to Anthropic and OpenAI on device.
 
+#### M1 as built — and what it changed
+
+**The build decision.** ClawAgent composes the shared cores *from source* rather
+than reimplementing or vendoring them. Three pieces make that work on a device
+with no build step:
+
+1. `ClawAgent/src/runtime/source-resolution.ts` installs a `module.registerHooks`
+   resolve hook that maps `@openclaw/*` onto `packages/*/src` and rewrites a
+   relative `.js` specifier to the `.ts` file that actually exists.
+2. `bin/clawagent.mjs` re-executes itself with `--experimental-transform-types`,
+   because `ai` and `retry` use TypeScript parameter properties that strip-only
+   mode rejects outright.
+3. `ClawAgent/package.json` declares the cores as `workspace:*` **and** their
+   external npm dependencies at the versions the cores pin.
+
+The precedent for 1 is the repository's own `test/vitest/vitest.shared.config.ts`,
+which already aliases these cores to source for tests. The alternatives were all
+worse and are recorded in `ClawAgent/AGENTS.md`: bundling on the device needs a
+native toolchain; committing a bundle cannot be reviewed and drifts; vendoring
+rewritten copies duplicates thousands of files and guarantees the behavioural
+drift this rebuild exists to avoid.
+
+**Three findings that the plan did not anticipate.**
+
+- *A package's `exports` map is authoritative, and dist paths are not flat.*
+  `@openclaw/llm-core/event-stream` declares `./dist/utils/event-stream.mjs`, so
+  its source is `src/utils/event-stream.ts`. A resolver that guessed
+  `src/<subpath>.ts` mapped it to nothing, which made `@openclaw/ai/providers` —
+  and therefore all of chat — unloadable. The hook now derives source paths from
+  the declared target, with the flat layout only as a fallback.
+- *Declared dependencies are not the real requirement.* `packages/ai` declares no
+  `@openclaw/*` dependency at all, yet its source imports `llm-core`,
+  `media-core`, `model-catalog-core`, and `normalization-core`. The reuse
+  manifest therefore separates what ClawAgent imports from what it loads, and
+  `reused-packages.ts` recomputes the external set so the boundary test fails on
+  drift instead of on a device.
+- *Vendor SDKs load lazily.* `registerBuiltInApiProviders` installs adapters that
+  `await import()` their module on first use, so startup touches only `typebox`.
+  That is why `doctor` and `chat --help` stay fast on a phone, and it is also why
+  a missing SDK surfaces at the first turn rather than at startup — which the
+  error text now says.
+
+**Delivered.** `clawagent chat`, interactive and one-shot (`-m`), streaming
+deltas as they arrive; Anthropic, OpenAI, Google, Mistral, and any
+OpenAI-compatible endpoint including a LAN model server; key resolution from an
+override variable, a `credentials/api-keys.json` file (with a warning when it is
+readable by others), or the provider's conventional variable; config from
+`clawagent.json` with environment and flag overrides; and errors classified into
+network / auth / rate-limit / model so a mobile failure says what to check.
+
+**Deviations from the plan above.**
+
+- The command is `chat`, not `ask` — it holds a conversation, not one question.
+- `src/llm/` implementing `AgentCoreRuntimeDeps` was **not** built. That
+  interface is the agent loop's dependency surface, and the loop is M2; wiring to
+  it now would mean inventing an agent that does not exist. M1 has a thinner seam
+  (`src/provider/runtime.ts`) that M2 will adapt.
+- `markdown-core` was **not** adopted. Streaming markdown into a terminal needs
+  `terminal-core` and reflow logic that is cosmetic next to getting a reply at
+  all; it moves to M2.
+- Exit codes grew: `3` config or credentials unusable, `4` the turn failed.
+
+**Proof status — incomplete, stated plainly.** Proven here: every production
+module loads through the hook; `@openclaw/ai` and `@openclaw/ai/providers`
+resolve and start with no network; the full chain reaches the vendor SDK's HTTP
+layer (verified with an invalid key, which returned the SDK's own connection
+error through the classifier); 526 unit tests and 82 on-device smoke checks pass.
+**Not** proven: the plan's "one live call each to Anthropic and OpenAI on
+device". This sandbox has no egress to provider APIs and is not an Android
+device, so a live streaming call on real hardware is still outstanding and is the
+first thing to verify on a phone.
+
 ### M2 — Agent loop + tools + approvals (~4-6 d)
 - **Adopts:** `@openclaw/agent-core` (agent loop, reasoning, stream steering, turn interruption), `tool-call-repair`.
 - **Builds:** `src/tools/` implementing `AgentTool` (`types.ts:562`) for `read`, `write`, `edit`, `bash`, `glob`, `grep`. **`bash` uses `child_process` + PATH resolution, never `/bin/sh`, never a PTY.** Approval prompts via `terminal-core`.
 - **Deliverable:** a multi-turn tool-using agent in the terminal that can edit files in a workspace.
 - **Proof:** scripted task ("create a file, read it back, fix a bug in it") completes with approvals honoured.
 - **This is the milestone that makes it an agent rather than a chat client.**
+
+#### M2 as built — and what it changed
+
+**The build decision.** The loop is `Agent` from `@openclaw/agent-core`, composed
+from source like everything else in M1, with two hooks doing the work ClawAgent
+owns: `beforeToolCall` consults the approval gate and can block a call before it
+runs, and `afterToolCall` enforces the per-message turn cap. Nothing in
+`packages/agent-core` was edited. Around it: `src/tools/` (six tools behind one
+containment boundary), `src/approvals/` (a pure policy plus a prompt gate), and
+`src/cli/agent.ts`.
+
+**Delivered.** `clawagent agent`, one-shot (`-m`) and interactive; the six tools
+(`read`, `write`, `edit`, `glob`, `grep`, `bash`); four approval modes
+(`read-only`, `workspace`, `ask`, `full`) plus `--yes`, with aliases a person
+recognises from other tools (`plan`, `auto-edit`, `yolo`); session grants per tool
+on `a`; a workspace root with a strict path policy; `--dry-run`, which prints the
+plan and calls nothing; a turn cap defaulting to 24 and capped at 200; provider
+failures classified the way `chat` classifies them, with the session surviving the
+failure so the user can retry.
+
+**Four deviations from the plan above.**
+
+- **Approvals do not use `terminal-core`.** Its styled select wraps
+  `@clack/prompts`, which needs a raw-mode TTY and reports `terminal=false` when
+  stdin is redirected — which is exactly how every gate here runs, and how a
+  scripted task is proven. It would also have added three dependencies to teach a
+  phone a UI library. Approvals share the queue-based readline prompter `chat`
+  already uses; EOF means "no", three unparseable answers mean "no". If a later
+  milestone wants the styled prompt, it has to survive a non-TTY first.
+- **`bash` refuses shell operators instead of quoting around them.** `;`, `&&`,
+  `|`, `>`, and `$(...)` are parsed out and rejected with a hint, rather than
+  being passed through to something that would mis-execute them. There is no
+  shell to be sorry about.
+- **Tool-call *repair* is wired, *promotion* is not.**
+  `stripPlainTextToolCallBlocks` runs on assistant text, because a model that
+  writes a tool call as prose otherwise silently does nothing. Promotion —
+  detecting a fenced call in text and turning it into a real call — needs
+  `markdown-core`'s code-region protection so a fenced example in the answer is
+  never read as an instruction, plus ~150 lines of iterator plumbing. It moves to
+  a later milestone rather than being guessed at.
+- **`read`/`glob`/`grep` never ask**, in any mode. An approval prompt for a
+  directory listing trains the user to answer prompts without reading them, and
+  the tools cannot write. `read-only` accordingly has three tools, not six.
+
+**Three findings that only running it produced.**
+
+- *Declared dependencies are still not the real requirement, one level deeper.*
+  `@openclaw/agent-core` reaches `@openclaw/ai`, whose source imports
+  `../../../markdown-core/src/reasoning-tags.js` by relative path — a cross-package
+  import no `exports` map or `dependencies` block records. Anything that loads the
+  loop therefore needs `markdown-core` plus `mdast-util-from-markdown`,
+  `mdast-util-gfm-table`, and `micromark-extension-gfm-table`. The load closure
+  (`SOURCE_LOAD_CLOSURE`) and the two override records (`LOAD_PATH_DEPENDENCIES`,
+  `UNDECLARED_DEPENDENCIES`) exist so this is a checked set rather than folklore.
+- *The install line in the README was broken, and the tests enforced the breakage.*
+  `package.json` listed the reused cores with `workspace:*`, a pnpm protocol; on a
+  phone, `npm install --omit=dev` fails with `EUNSUPPORTEDPROTOCOL` before it
+  downloads anything. The M1 boundary test *required* that range, so the suite was
+  green while the documented install was impossible. The cores now live in the
+  `clawagent.reusedPackages` block, `dependencies` holds only registry packages,
+  and a new test fails on any non-registry range so this class of bug cannot come
+  back quietly.
+- *`doctor` could not run before an install.* The same M2 wiring put `typebox` in
+  the static import closure of `src/cli/main.ts` (via the tool layer), so
+  `clawagent version`, `help`, and `doctor` all died with `ERR_MODULE_NOT_FOUND` on
+  a fresh clone — the one state doctor exists to diagnose. The tool layer is now
+  imported where it is used, and the boundary test walks the startup closure to
+  keep it that way.
+
+**Proof status — stated plainly.** The plan's proof is met in the sandbox: a
+scripted task (write `sum.js`, read it back, fix the bug) completes through the
+real loop against real files with a faked transport, approvals are honoured per
+tool, a declined `write` leaves no file and still ends `ok`, `rm -rf /` is refused
+with no prompt in `full`, and the turn cap stops a runaway script with a
+`stoppedReason` rather than an error. 748 unit tests, 0 typecheck errors in
+`ClawAgent/`, and 117 smoke checks pass, including a run against a
+device-shaped tree (nothing above the package but its own `node_modules`).
+
+**Not proven, and unchanged from M1:** a live model call from an Android device.
+M2 adds a second unknown of the same kind — this loop has never run on Bionic — so
+the first phone session should run `clawagent agent --dry-run`, then a one-shot
+task, before anything is trusted with a real workspace.
 
 ### M3 — Persistence: sessions, transcripts, compaction (~3-4 d)
 - **Adopts:** `agent-core` compaction (`compact`, `prepareCompaction`, `estimateContextTokens`, `generateSummary`, `findCutPoint`), `session-url-contract`.
