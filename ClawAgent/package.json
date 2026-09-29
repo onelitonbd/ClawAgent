@@ -1,0 +1,27 @@
+{
+  "name": "clawagent",
+  "version": "0.0.0-private",
+  "private": true,
+  "description": "Termux-native OpenClaw host for Android. Composes the shared @openclaw/* cores; never imports src/, extensions/, or openclaw/plugin-sdk.",
+  "type": "module",
+  "files": [
+    "bin",
+    "dist",
+    "scripts"
+  ],
+  "bin": {
+    "clawagent": "./bin/clawagent.mjs"
+  },
+  "scripts": {
+    "doctor": "node ./bin/clawagent.mjs doctor",
+    "smoke": "bash ./scripts/smoke-termux.sh",
+    "test": "cd .. && node scripts/run-vitest.mjs run --config test/vitest/vitest.unit.config.ts ClawAgent"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@openclaw/normalization-core": "workspace:*"
+  },
+  "engines": {
+    "node": ">=24.16.0 <25 || >=26.1.0"
+  }
+}

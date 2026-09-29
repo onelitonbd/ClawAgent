@@ -321,6 +321,6 @@
       "@openclaw/*": ["./extensions/*"]
     }
   },
-  "include": ["src/**/*", "ui/**/*", "extensions/**/*", "packages/**/*"],
+  "include": ["src/**/*", "ui/**/*", "extensions/**/*", "packages/**/*", "ClawAgent/**/*"],
   "exclude": ["node_modules", "dist", "**/dist/**", "**/*.test-compat.d.ts"]
 }

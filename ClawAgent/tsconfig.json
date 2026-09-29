@@ -1,0 +1,13 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    // This folder must run directly under Node's native type stripping on an
+    // Android device with no build step, which resolves only real file
+    // extensions. Relative imports therefore use ".ts" specifiers rather than
+    // the ".js" specifiers used by src/ and packages/. See AGENTS.md.
+    "types": ["node"],
+    "lib": ["ES2023"]
+  },
+  "include": ["**/*.ts", "**/*.mts"],
+  "exclude": ["node_modules", "dist"]
+}

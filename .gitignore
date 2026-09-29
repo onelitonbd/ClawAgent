@@ -50,6 +50,12 @@ apps/swabble/Package.resolved
 **/ModuleCache/
 bin/
 bin/clawdbot-mac
+# The rule above ignores every bin/ at any depth, but ClawAgent ships its CLI
+# entry point in bin/ and runs it from source on the device, so it must be
+# tracked. Git cannot re-include a file whose parent directory is excluded,
+# hence both lines.
+!ClawAgent/bin/
+!ClawAgent/bin/**
 apps/macos/.build-local/
 apps/macos/.swiftpm/
 apps/shared/MoltbotKit/.swiftpm/
